@@ -1,247 +1,141 @@
-import os
-from typing import Any
+from pathlib import Path
 
 import gradio as gr
-import numpy as np
 import plotly.graph_objects as go
 import whisper
 from transformers import pipeline
 
 
-APP_TITLE = "Audio Intelligence Ultra"
-WHISPER_MODEL_NAME = "base"
-SENTIMENT_MODEL_NAME = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
-TARGET_SAMPLE_RATE = 16000
+print("Initializing Whisper, sentiment, and summarization models...")
+whisper_model = whisper.load_model("base")
+sentiment_analyzer = pipeline("sentiment-analysis")
+
+try:
+    summarizer = pipeline("text2text-generation", model="t5-small")
+except Exception as exc:
+    print(f"Warning: summarization model failed to load: {exc}")
+    summarizer = None
 
 
-def load_models() -> tuple[Any, Any]:
-    print("Initializing AI models...")
-    whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
-    sentiment_analyzer = pipeline(
-        "sentiment-analysis",
-        model=SENTIMENT_MODEL_NAME,
-    )
-    return whisper_model, sentiment_analyzer
-
-
-WHISPER_MODEL, SENTIMENT_ANALYZER = load_models()
-
-
-def normalize_audio(audio_array: np.ndarray) -> np.ndarray:
-    if audio_array.ndim > 1:
-        audio_array = audio_array.mean(axis=1)
-
-    if np.issubdtype(audio_array.dtype, np.integer):
-        max_value = np.iinfo(audio_array.dtype).max
-        audio_array = audio_array.astype(np.float32) / max_value
-    else:
-        audio_array = audio_array.astype(np.float32)
-
-    max_amplitude = np.max(np.abs(audio_array)) if audio_array.size else 0.0
-    if max_amplitude > 1.0:
-        audio_array = audio_array / max_amplitude
-
-    return np.clip(audio_array, -1.0, 1.0)
-
-
-def resample_audio(audio_array: np.ndarray, original_rate: int, target_rate: int) -> np.ndarray:
-    if original_rate == target_rate or audio_array.size == 0:
-        return audio_array.astype(np.float32)
-
-    duration = audio_array.shape[0] / float(original_rate)
-    target_length = max(int(round(duration * target_rate)), 1)
-
-    original_positions = np.linspace(0.0, duration, num=audio_array.shape[0], endpoint=False)
-    target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
-
-    return np.interp(target_positions, original_positions, audio_array).astype(np.float32)
-
-
-def prepare_audio(audio_input: tuple[int, np.ndarray] | None) -> tuple[np.ndarray | None, float]:
-    if audio_input is None:
-        return None, 0.0
-
-    sample_rate, audio_array = audio_input
-    if audio_array is None or len(audio_array) == 0:
-        return None, 0.0
-
-    audio_array = normalize_audio(np.asarray(audio_array))
-    duration_seconds = float(audio_array.shape[0]) / float(sample_rate)
-    audio_array = resample_audio(audio_array, sample_rate, TARGET_SAMPLE_RATE)
-
-    return audio_array, duration_seconds
-
-
-def create_sentiment_plot(label: str, score: float) -> go.Figure:
-    positive = label.upper() == "POSITIVE"
-    color = "#818cf8" if positive else "#f87171"
-
+def create_sentiment_plot(label: str, score: float):
+    color = "#6366f1" if label == "POSITIVE" else "#ef4444"
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
             value=score,
-            number={"suffix": "%"},
-            title={"text": f"Sentiment: {label.title()}", "font": {"size": 20}},
+            title={"text": f"Sentiment: {label}", "font": {"size": 18}},
             gauge={
                 "axis": {"range": [0, 100], "tickcolor": "white"},
                 "bar": {"color": color},
-                "bgcolor": "#111827",
+                "bgcolor": "#1f2937",
                 "borderwidth": 2,
                 "bordercolor": "#374151",
-                "steps": [
-                    {"range": [0, 40], "color": "#3f1d1d"},
-                    {"range": [40, 60], "color": "#3f3720"},
-                    {"range": [60, 100], "color": "#1f3b2d"},
-                ],
             },
         )
     )
     fig.update_layout(
-        height=280,
-        margin=dict(l=24, r=24, t=60, b=24),
+        height=250,
+        margin=dict(l=30, r=30, t=50, b=20),
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="white"),
     )
     return fig
 
 
-def build_sentiment_highlight(label: str, score: float) -> list[tuple[str, str]]:
-    summary = f"{label.title()} ({score:.2f}%)"
-    category = "positive" if label.upper() == "POSITIVE" else "negative"
-    return [(summary, category)]
+def export_transcript(text: str) -> str:
+    file_path = Path("transcript_export.txt")
+    file_path.write_text(text, encoding="utf-8")
+    return str(file_path)
 
 
-def process_audio(audio_input: tuple[int, np.ndarray] | None, task_type: str):
-    if audio_input is None:
-        empty_plot = create_sentiment_plot("Neutral", 0.0)
-        return "Upload an audio file to begin.", "0", "0.0", "", [("No analysis yet", None)], empty_plot
-
-    audio_array, duration_seconds = prepare_audio(audio_input)
-    if audio_array is None:
-        empty_plot = create_sentiment_plot("Neutral", 0.0)
-        return "The uploaded audio could not be read.", "0", "0.0", "", [("No analysis yet", None)], empty_plot
+def process_audio(audio_path, task_type):
+    if not audio_path:
+        return "No audio provided.", None, [], "0 words", "0 WPM", "No summary available.", None
 
     task = "translate" if task_type == "Translate to English" else "transcribe"
 
     try:
-        result = WHISPER_MODEL.transcribe(audio_array, task=task, fp16=False, language=None)
+        result = whisper_model.transcribe(audio_path, task=task, fp16=False)
     except Exception as exc:
-        empty_plot = create_sentiment_plot("Neutral", 0.0)
-        return (
-            f"Audio processing failed: {exc}",
-            "0",
-            "0.0",
-            "",
-            [("Analysis failed", "negative")],
-            empty_plot,
-        )
+        message = f"Audio processing failed: {exc}"
+        return message, None, [], "0 words", "0 WPM", "No summary available.", None
 
-    transcript = result.get("text", "").strip()
-    if not transcript:
-        empty_plot = create_sentiment_plot("Neutral", 0.0)
-        return "No speech detected in the audio.", "0", "0.0", "", [("No speech detected", None)], empty_plot
+    text = result.get("text", "").strip()
+    segments = result.get("segments") or []
+    duration = segments[-1].get("end", 0) if segments else 0
+    word_count = len(text.split())
+    wpm = round((word_count / (duration / 60)), 1) if duration > 0 else 0
 
-    word_count = len(transcript.split())
-    wpm = round(word_count / (duration_seconds / 60.0), 1) if duration_seconds > 0 else 0.0
+    sentiment = sentiment_analyzer(text[:512] or "No transcript available.")[0]
+    label = sentiment["label"]
+    score = round(sentiment["score"] * 100, 2)
+    plot = create_sentiment_plot(label, score)
 
-    sentiment_result = SENTIMENT_ANALYZER(transcript[:512])[0]
-    sentiment_label = sentiment_result["label"]
-    sentiment_score = round(float(sentiment_result["score"]) * 100.0, 2)
+    summary = "Summary model not available."
+    if summarizer:
+        if word_count > 20:
+            try:
+                summary = summarizer(
+                    f"summarize: {text[:512]}",
+                    max_length=60,
+                    min_length=10,
+                    do_sample=False,
+                )[0]["generated_text"]
+            except Exception:
+                summary = "Summary generation failed."
+        else:
+            summary = "Text too short to summarize."
 
-    return (
-        transcript,
-        str(word_count),
-        str(wpm),
-        f"{duration_seconds:.2f} sec",
-        build_sentiment_highlight(sentiment_label, sentiment_score),
-        create_sentiment_plot(sentiment_label, sentiment_score),
-    )
+    file_out = export_transcript(text)
+    highlighted = [(label, label)]
+    return text, plot, highlighted, f"{word_count} words", f"{wpm} WPM", summary, file_out
 
 
-CUSTOM_CSS = """
-body {
-    background:
-        radial-gradient(circle at top left, rgba(99, 102, 241, 0.22), transparent 30%),
-        linear-gradient(180deg, #020617 0%, #0f172a 55%, #111827 100%);
-}
-.gradio-container {
-    max-width: 1200px !important;
-}
-.panel-card {
-    border: 1px solid rgba(148, 163, 184, 0.16);
-    border-radius: 18px;
-    background: rgba(15, 23, 42, 0.72);
-    backdrop-filter: blur(12px);
+custom_css = """
+.gradio-container { background: #0f172a !important; padding: 10px !important; }
+.stat-box { border: 1px solid #374151; background: #1f2937; padding: 10px; border-radius: 8px; font-size: 14px; }
+#submit_btn { margin-top: 10px; }
+@media (max-width: 600px) {
+    .stat-box { font-size: 12px; }
+    h1 { font-size: 24px !important; }
 }
 """
 
 
-theme = gr.themes.Soft(
-    primary_hue="indigo",
-    neutral_hue="slate",
-)
-
-
-with gr.Blocks(theme=theme, css=CUSTOM_CSS, title=APP_TITLE) as app:
-    gr.Markdown(
-        """
-        # Audio Intelligence Ultra
-        Upload an audio file, then run either transcription or translation to English.
-        The app also calculates word count, speaking speed, and transcript sentiment.
-        """
-    )
+with gr.Blocks(theme=gr.themes.Default(primary_hue="indigo"), css=custom_css) as app:
+    gr.Markdown("# Audio Intelligence Ultra")
 
     with gr.Row():
-        with gr.Column(scale=1, elem_classes="panel-card"):
-            audio_input = gr.Audio(
-                label="Upload Audio File",
-                type="numpy",
-            )
+        with gr.Column(scale=1, min_width=300):
+            audio_input = gr.Audio(type="filepath", label="Audio Source")
             task_radio = gr.Radio(
-                ["Transcribe", "Translate to English"],
-                value="Transcribe",
+                ["Transcribe (Original)", "Translate to English"],
+                value="Transcribe (Original)",
                 label="Task",
             )
-            analyze_button = gr.Button("Run Analysis", variant="primary")
+            submit_btn = gr.Button("Run Analysis", variant="primary", elem_id="submit_btn")
+            download_out = gr.File(label="Download Transcript")
 
-        with gr.Column(scale=2, elem_classes="panel-card"):
+        with gr.Column(scale=1, min_width=300):
             with gr.Row():
-                words_output = gr.Textbox(label="Words", interactive=False)
-                wpm_output = gr.Textbox(label="Speed (WPM)", interactive=False)
-                duration_output = gr.Textbox(label="Duration", interactive=False)
+                word_stat = gr.Textbox(label="Words", elem_classes="stat-box")
+                wpm_stat = gr.Textbox(label="Speed", elem_classes="stat-box")
 
-            transcript_output = gr.Textbox(
-                label="Full Transcript",
-                lines=12,
-                max_lines=18,
-                interactive=False,
-                show_copy_button=True,
-            )
+            with gr.Tabs():
+                with gr.TabItem("Text"):
+                    text_output = gr.Textbox(label="Full Transcript", lines=6)
+                with gr.TabItem("AI Summary"):
+                    summary_output = gr.Textbox(label="Key Points", lines=4)
+                with gr.TabItem("Analytics"):
+                    sentiment_label = gr.HighlightedText(label="Sentiment")
+                    plot_output = gr.Plot()
 
-            with gr.Row():
-                sentiment_output = gr.HighlightedText(
-                    label="Sentiment",
-                    color_map={"positive": "#14532d", "negative": "#7f1d1d"},
-                    interactive=False,
-                )
-                gauge_output = gr.Plot(label="Sentiment Gauge")
-
-    analyze_button.click(
+    submit_btn.click(
         fn=process_audio,
         inputs=[audio_input, task_radio],
-        outputs=[
-            transcript_output,
-            words_output,
-            wpm_output,
-            duration_output,
-            sentiment_output,
-            gauge_output,
-        ],
+        outputs=[text_output, plot_output, sentiment_label, word_stat, wpm_stat, summary_output, download_out],
     )
 
 
 if __name__ == "__main__":
-    server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
-    server_port = int(os.getenv("PORT", "7860"))
-    app.launch(server_name=server_name, server_port=server_port)
+    app.launch(debug=True)
