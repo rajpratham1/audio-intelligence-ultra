@@ -1,6 +1,6 @@
 gradio
-numpy
 openai-whisper
 plotly
+sentencepiece
 torch
 transformers
